@@ -10,12 +10,46 @@ from pathlib import Path
 import re
 
 
-DB_PATH = Path("ledger.db")
+DEFAULT_DB_PATH = Path("ledger.db")
 LOCAL_MODEL_NAME = "all-MiniLM-L6-v2"
 LMSTUDIO_URL = "http://localhost:1234/v1/embeddings"
+DEFAULT_LLM_URL = "http://10.2.0.2:1234/v1/chat/completions"
+DEFAULT_LLM_MODEL = "microsoft/phi-4"
 REVERSAL_FLAG = "⚠ POSSIBLE REVERSAL"
 POSITIVE_TYPES = {"belief", "conclusion", "inference", "supported", "decision"}
 NEGATIVE_TYPES = {"falsified", "blocked"}
+LLM_CLAIM_TYPES = {
+    "belief",
+    "decision",
+    "conclusion",
+    "inference",
+    "plan",
+    "non_collapse",
+    "falsified",
+    "supported",
+    "blocked",
+    "other",
+}
+SAMPLE_CONVERSATION_IDS = {"conv-alpha", "conv-beta", "conv-gamma"}
+SAMPLE_CONVERSATION_TITLES = {"Alpha Stability", "Beta Support", "Gamma Reversal"}
+LLM_EXTRACTION_INSTRUCTIONS = """You extract asserted claims from one message in a conversation.
+A claim is a statement the speaker asserts as true, decided, concluded,
+rejected, or planned - a position they are taking, not a question or aside.
+
+RULES:
+- Quote each claim VERBATIM from the message text. Do not paraphrase,
+  summarize, rewrite, or correct. Use the speaker's exact words.
+- If a claim spans a clause, quote the clause exactly as written.
+- Extract only what is actually asserted in THIS message. Do not infer,
+  do not add context, do not combine with outside knowledge.
+- If the message asserts nothing (a question, a greeting, pure acknowledgment),
+  return an empty list.
+- Do not judge, score, or rate claims. Only extract them.
+- Classify each as one of: belief, decision, conclusion, inference, plan,
+  non_collapse, falsified, supported, blocked, other.
+
+Return ONLY a JSON array, no prose:
+[{"claim_text": "<verbatim quote>", "claim_type": "<type>"}]"""
 
 
 PATTERN_SPECS = [
@@ -46,8 +80,13 @@ def first_nonempty(*values):
     return None
 
 
-def connect_db():
-    conn = sqlite3.connect(DB_PATH)
+def normalize_db_path(db_path):
+    return Path(db_path)
+
+
+def connect_db(db_path):
+    resolved_db_path = normalize_db_path(db_path)
+    conn = sqlite3.connect(resolved_db_path)
     conn.row_factory = sqlite3.Row
     ensure_schema(conn)
     return conn
@@ -90,6 +129,17 @@ def ensure_schema(conn):
     conn.commit()
 
 
+def reset_schema(conn):
+    conn.executescript(
+        """
+        DROP TABLE IF EXISTS claims;
+        DROP TABLE IF EXISTS turns;
+        DROP TABLE IF EXISTS conversations;
+        """
+    )
+    ensure_schema(conn)
+
+
 def stable_fallback_id(prefix, payload):
     encoded = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
     return f"{prefix}-{hashlib.sha1(encoded).hexdigest()[:12]}"
@@ -122,44 +172,71 @@ def extract_message_text(message):
     return ""
 
 
-def load_conversation_payloads(input_path):
+def is_conversation_payload(payload):
+    if not isinstance(payload, dict):
+        return False
+
+    messages = payload.get("chat_messages")
+    if not isinstance(messages, list):
+        messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return False
+
+    return any(field in payload for field in ("uuid", "id", "name", "title", "created_at", "updated_at"))
+
+
+def iter_json_files(input_path):
     path = Path(input_path)
     if not path.exists():
         raise SystemExit(f"Input path not found: {input_path}")
 
     if path.is_dir():
-        files = sorted(p for p in path.iterdir() if p.suffix.lower() == ".json")
-        for file_path in files:
-            yield from load_json_payload(file_path)
+        for file_path in sorted(p for p in path.rglob("*.json") if p.is_file()):
+            yield file_path
         return
 
-    yield from load_json_payload(path)
+    yield path
 
 
 def load_json_payload(file_path):
-    with file_path.open("r", encoding="utf-8") as handle:
-        payload = json.load(handle)
+    try:
+        with file_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except json.JSONDecodeError:
+        print(f"Skipping unreadable JSON: {file_path}")
+        return []
 
     if isinstance(payload, list):
-        for item in payload:
-            if isinstance(item, dict):
-                yield item
-        return
+        return [item for item in payload if is_conversation_payload(item)]
 
-    if isinstance(payload, dict):
-        yield payload
-        return
+    if is_conversation_payload(payload):
+        return [payload]
 
-    raise SystemExit(f"Unsupported JSON shape in {file_path}")
+    return []
 
 
-def ingest_export(input_path):
-    conn = connect_db()
+def collect_conversation_payloads(input_path):
+    payloads = []
+    scanned_file_count = 0
+
+    for file_path in iter_json_files(input_path):
+        scanned_file_count += 1
+        payloads.extend(load_json_payload(file_path))
+
+    return payloads, scanned_file_count, len(payloads)
+
+
+def ingest_export(input_path, db_path, reset=False):
+    conn = connect_db(db_path)
+    resolved_db_path = normalize_db_path(db_path)
     inserted_conversations = 0
     inserted_turns = 0
+    payloads, scanned_file_count, accepted_payload_count = collect_conversation_payloads(input_path)
 
     with conn:
-        for conversation in load_conversation_payloads(input_path):
+        if reset:
+            reset_schema(conn)
+        for conversation in payloads:
             conv_id = first_nonempty(
                 conversation.get("uuid"),
                 conversation.get("id"),
@@ -214,7 +291,9 @@ def ingest_export(input_path):
             inserted_conversations += 1
             inserted_turns += len(turn_rows)
 
-    print(f"Ingested {inserted_conversations} conversations and {inserted_turns} turns into {DB_PATH}.")
+    print(f"Scanned {scanned_file_count} JSON files.")
+    print(f"Accepted {accepted_payload_count} conversation payloads.")
+    print(f"Ingested {inserted_conversations} conversations and {inserted_turns} turns into {resolved_db_path}.")
 
 
 def spans_overlap(candidate_start, candidate_end, accepted_spans):
@@ -224,13 +303,212 @@ def spans_overlap(candidate_start, candidate_end, accepted_spans):
     return False
 
 
-def build_claim_id(conv_id, turn_id, char_start, char_end, claim_text):
-    raw = f"{conv_id}|{turn_id}|{char_start}|{char_end}|{claim_text}"
+def build_claim_id(conv_id, turn_id, char_start, char_end, claim_text, extraction_method, occurrence_index=0):
+    raw = f"{conv_id}|{turn_id}|{char_start}|{char_end}|{claim_text}|{extraction_method}|{occurrence_index}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
-def extract_claims():
-    conn = connect_db()
+def build_claim_row(turn, char_start, char_end, claim_text, claim_type, extraction_method, occurrence_index=0):
+    return (
+        build_claim_id(
+            turn["conv_id"],
+            turn["turn_id"],
+            char_start,
+            char_end,
+            claim_text,
+            extraction_method,
+            occurrence_index,
+        ),
+        turn["conv_id"],
+        turn["turn_id"],
+        char_start,
+        char_end,
+        claim_text,
+        claim_type,
+        extraction_method,
+        "candidate",
+        turn["timestamp"],
+        None,
+        None,
+    )
+
+
+def extract_deterministic_claims_for_turn(turn):
+    accepted_spans = []
+    turn_matches = []
+    text = turn["text"] or ""
+    for claim_type, pattern in PATTERN_SPECS:
+        for match in pattern.finditer(text):
+            char_start, char_end = match.span()
+            if char_start == char_end:
+                continue
+            if spans_overlap(char_start, char_end, accepted_spans):
+                continue
+            claim_text = text[char_start:char_end]
+            if not claim_text.strip():
+                continue
+            accepted_spans.append((char_start, char_end))
+            turn_matches.append(
+                (
+                    char_start,
+                    build_claim_row(
+                        turn,
+                        char_start,
+                        char_end,
+                        claim_text,
+                        claim_type,
+                        "deterministic",
+                    ),
+                )
+            )
+    turn_matches.sort(key=lambda item: item[0])
+    return [row for _, row in turn_matches]
+
+
+def strip_markdown_fences(text):
+    stripped = text.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", stripped, re.IGNORECASE | re.DOTALL)
+    if fenced:
+        return fenced.group(1).strip()
+    return stripped
+
+
+def parse_json_array_response(text):
+    stripped = strip_markdown_fences(text)
+    candidates = [stripped]
+    start = stripped.find("[")
+    end = stripped.rfind("]")
+    if start != -1 and end != -1 and end >= start:
+        bracketed = stripped[start : end + 1]
+        if bracketed not in candidates:
+            candidates.append(bracketed)
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, list):
+            return parsed
+    return None
+
+
+def find_verbatim_span(source_text, claim_text):
+    match = re.search(re.escape(claim_text), source_text, re.IGNORECASE)
+    if match is None:
+        return None
+    return match.span()
+
+
+def normalize_llm_claim_type(raw_claim_type):
+    claim_type = (raw_claim_type or "other").strip().lower()
+    if claim_type not in LLM_CLAIM_TYPES:
+        return "other"
+    return claim_type
+
+
+def extract_content_from_chat_response(body):
+    choices = body.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        return None
+
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                text_parts.append(part["text"])
+        if text_parts:
+            return "".join(text_parts)
+    return None
+
+
+def extract_llm_claims(turn_rows, llm_url, llm_model):
+    try:
+        import requests
+    except ImportError as exc:
+        raise SystemExit(
+            "requests is required for `extract --method llm|both`. Install dependencies from requirements.txt."
+        ) from exc
+
+    llm_rows = []
+    turns_with_claims = set()
+    dropped_non_verbatim = 0
+
+    for turn in turn_rows:
+        payload = {
+            "model": llm_model,
+            "messages": [
+                {"role": "system", "content": LLM_EXTRACTION_INSTRUCTIONS},
+                {"role": "user", "content": f"Message text:\n{turn['text'] or ''}"},
+            ],
+        }
+
+        try:
+            response = requests.post(llm_url, json=payload, timeout=30)
+            response.raise_for_status()
+        except requests.exceptions.RequestException as exc:
+            print(f"LLM extraction skipped: unable to reach {llm_url} ({exc})")
+            return [], set(), 0
+
+        try:
+            body = response.json()
+        except ValueError:
+            print(f"Skipping LLM claims for turn_id={turn['turn_id']}: response was not valid JSON.")
+            continue
+
+        content = extract_content_from_chat_response(body)
+        if not isinstance(content, str):
+            print(f"Skipping LLM claims for turn_id={turn['turn_id']}: response missing message content.")
+            continue
+
+        parsed_claims = parse_json_array_response(content)
+        if parsed_claims is None:
+            print(f"Skipping LLM claims for turn_id={turn['turn_id']}: could not parse JSON array.")
+            continue
+
+        accepted_rows = []
+        for occurrence_index, item in enumerate(parsed_claims):
+            if not isinstance(item, dict):
+                continue
+            claim_text = item.get("claim_text")
+            if not isinstance(claim_text, str) or not claim_text.strip():
+                continue
+
+            claim_type = normalize_llm_claim_type(item.get("claim_type"))
+            span = find_verbatim_span(turn["text"] or "", claim_text)
+            if span is None:
+                dropped_non_verbatim += 1
+                continue
+
+            char_start, char_end = span
+            accepted_rows.append(
+                build_claim_row(
+                    turn,
+                    char_start,
+                    char_end,
+                    (turn["text"] or "")[char_start:char_end],
+                    claim_type,
+                    "llm",
+                    occurrence_index,
+                )
+            )
+
+        if accepted_rows:
+            turns_with_claims.add(turn["turn_id"])
+            llm_rows.extend(accepted_rows)
+
+    return llm_rows, turns_with_claims, dropped_non_verbatim
+
+
+def extract_claims(db_path, method, llm_url, llm_model):
+    conn = connect_db(db_path)
+    resolved_db_path = normalize_db_path(db_path)
     turn_rows = conn.execute(
         """
         SELECT turn_id, conv_id, timestamp, text
@@ -239,43 +517,22 @@ def extract_claims():
         """
     ).fetchall()
 
-    claims_to_insert = []
-    for turn in turn_rows:
-        accepted_spans = []
-        turn_matches = []
-        text = turn["text"] or ""
-        for claim_type, pattern in PATTERN_SPECS:
-            for match in pattern.finditer(text):
-                char_start, char_end = match.span()
-                if char_start == char_end:
-                    continue
-                if spans_overlap(char_start, char_end, accepted_spans):
-                    continue
-                claim_text = text[char_start:char_end]
-                if not claim_text.strip():
-                    continue
-                accepted_spans.append((char_start, char_end))
-                turn_matches.append(
-                    (
-                        char_start,
-                        (
-                            build_claim_id(turn["conv_id"], turn["turn_id"], char_start, char_end, claim_text),
-                            turn["conv_id"],
-                            turn["turn_id"],
-                            char_start,
-                            char_end,
-                            claim_text,
-                            claim_type,
-                            "deterministic",
-                            "candidate",
-                            turn["timestamp"],
-                            None,
-                            None,
-                        ),
-                    )
-                )
-        turn_matches.sort(key=lambda item: item[0])
-        claims_to_insert.extend(row for _, row in turn_matches)
+    deterministic_rows = []
+    deterministic_turns = set()
+    if method in {"deterministic", "both"}:
+        for turn in turn_rows:
+            rows = extract_deterministic_claims_for_turn(turn)
+            if rows:
+                deterministic_rows.extend(rows)
+                deterministic_turns.add(turn["turn_id"])
+
+    llm_rows = []
+    llm_turns = set()
+    dropped_non_verbatim = 0
+    if method in {"llm", "both"}:
+        llm_rows, llm_turns, dropped_non_verbatim = extract_llm_claims(turn_rows, llm_url, llm_model)
+
+    claims_to_insert = deterministic_rows + llm_rows
 
     with conn:
         conn.execute("DELETE FROM claims")
@@ -291,7 +548,12 @@ def extract_claims():
             claims_to_insert,
         )
 
-    print(f"Extracted {len(claims_to_insert)} claims into {DB_PATH}.")
+    print(f"Extracted {len(claims_to_insert)} claims into {resolved_db_path}.")
+    print(f"deterministic claims: {len(deterministic_rows)}")
+    print(f"llm claims: {len(llm_rows)}")
+    print(f"llm dropped (non-verbatim): {dropped_non_verbatim}")
+    print(f"turns with claims (det): {len(deterministic_turns)} / {len(turn_rows)}")
+    print(f"turns with claims (llm): {len(llm_turns)} / {len(turn_rows)}")
 
 
 def embed(texts, backend):
@@ -374,8 +636,8 @@ def comparison_text_for_embedding(claim_type, claim_text):
     return core or text
 
 
-def cluster_claims(backend, threshold):
-    conn = connect_db()
+def cluster_claims(db_path, backend, threshold):
+    conn = connect_db(db_path)
     claim_rows = conn.execute(
         """
         SELECT claim_id, claim_text, claim_type, timestamp
@@ -476,8 +738,8 @@ def find_reversal(claims):
     return None
 
 
-def view_clusters(min_count):
-    conn = connect_db()
+def view_clusters(db_path, min_count):
+    conn = connect_db(db_path)
     claim_rows = conn.execute(
         """
         SELECT
@@ -541,18 +803,93 @@ def view_clusters(min_count):
         print(f"No clusters matched min-count={min_count}.")
 
 
+def stats_db(db_path):
+    conn = connect_db(db_path)
+    resolved_db_path = normalize_db_path(db_path)
+
+    conversation_count = conn.execute("SELECT COUNT(*) FROM conversations").fetchone()[0]
+    turn_count = conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0]
+    claim_count = conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
+    clustered_claim_count = conn.execute(
+        "SELECT COUNT(*) FROM claims WHERE cluster_id IS NOT NULL"
+    ).fetchone()[0]
+    distinct_cluster_count = conn.execute(
+        "SELECT COUNT(DISTINCT cluster_id) FROM claims WHERE cluster_id IS NOT NULL"
+    ).fetchone()[0]
+    claim_counts_by_type = conn.execute(
+        """
+        SELECT claim_type, COUNT(*) AS claim_count
+        FROM claims
+        GROUP BY claim_type
+        ORDER BY claim_count DESC, claim_type ASC
+        """
+    ).fetchall()
+    top_conversations = conn.execute(
+        """
+        SELECT
+            conversations.title,
+            conversations.conv_id,
+            COUNT(claims.claim_id) AS claim_count
+        FROM conversations
+        LEFT JOIN claims ON claims.conv_id = conversations.conv_id
+        GROUP BY conversations.conv_id, conversations.title
+        ORDER BY claim_count DESC, conversations.title ASC, conversations.conv_id ASC
+        LIMIT 10
+        """
+    ).fetchall()
+    conversation_rows = conn.execute("SELECT conv_id, title FROM conversations ORDER BY conv_id").fetchall()
+
+    print(f"database path: {resolved_db_path}")
+    print(f"conversation count: {conversation_count}")
+    print(f"turn count: {turn_count}")
+    print(f"claim count: {claim_count}")
+    print(f"clustered claim count: {clustered_claim_count}")
+    print(f"distinct cluster count: {distinct_cluster_count}")
+    print("claim counts by type:")
+    if claim_counts_by_type:
+        for row in claim_counts_by_type:
+            print(f"  {row['claim_type']}: {row['claim_count']}")
+    else:
+        print("  (none)")
+
+    print("top 10 conversations by claim count:")
+    if top_conversations:
+        for row in top_conversations:
+            title = row["title"] or row["conv_id"]
+            print(f"  {row['claim_count']}: {title} <{row['conv_id']}>")
+    else:
+        print("  (none)")
+
+    if conversation_count > 0 and claim_count == 0:
+        print("warning: conversations > 0 but claims == 0")
+    if claim_count > 0 and clustered_claim_count == 0:
+        print("warning: claims > 0 but clustered_claims == 0")
+    if conversation_count > 0 and all(
+        row["conv_id"] in SAMPLE_CONVERSATION_IDS or (row["title"] or "") in SAMPLE_CONVERSATION_TITLES
+        for row in conversation_rows
+    ):
+        print("warning: only sample_export conversations appear")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description="Conversation Ledger")
+    parser.add_argument("--db", default=str(DEFAULT_DB_PATH))
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     ingest_parser = subparsers.add_parser("ingest")
     ingest_parser.add_argument("input_path")
+    ingest_parser.add_argument("--reset", action="store_true")
 
-    subparsers.add_parser("extract")
+    extract_parser = subparsers.add_parser("extract")
+    extract_parser.add_argument("--method", choices=["deterministic", "llm", "both"], default="deterministic")
+    extract_parser.add_argument("--llm-url", default=DEFAULT_LLM_URL)
+    extract_parser.add_argument("--llm-model", default=DEFAULT_LLM_MODEL)
 
     cluster_parser = subparsers.add_parser("cluster")
     cluster_parser.add_argument("--backend", choices=["local", "lmstudio"], default="local")
     cluster_parser.add_argument("--threshold", type=float, default=0.75)
+
+    subparsers.add_parser("stats")
 
     view_parser = subparsers.add_parser("view")
     view_parser.add_argument("--min-count", type=int, default=1)
@@ -571,13 +908,15 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.command == "ingest":
-        ingest_export(args.input_path)
+        ingest_export(args.input_path, args.db, reset=args.reset)
     elif args.command == "extract":
-        extract_claims()
+        extract_claims(args.db, args.method, args.llm_url, args.llm_model)
     elif args.command == "cluster":
-        cluster_claims(args.backend, args.threshold)
+        cluster_claims(args.db, args.backend, args.threshold)
+    elif args.command == "stats":
+        stats_db(args.db)
     elif args.command == "view":
-        view_clusters(args.min_count)
+        view_clusters(args.db, args.min_count)
     else:
         parser.error(f"Unknown command: {args.command}")
     return 0

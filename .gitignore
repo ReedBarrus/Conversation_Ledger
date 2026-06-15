@@ -1,0 +1,8 @@
+﻿conversation_data/
+*.zip
+*.db
+*.sqlite
+*.sqlite3
+view_*.txt
+raw_*.txt
+reports/private/
