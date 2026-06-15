@@ -52,20 +52,44 @@ Return ONLY a JSON array, no prose:
 [{"claim_text": "<verbatim quote>", "claim_type": "<type>"}]"""
 
 
-PATTERN_SPECS = [
-    ("belief", re.compile(r"\bI think\b[^.!?\r\n]*", re.IGNORECASE)),
-    ("decision", re.compile(r"\bwe decided\b[^.!?\r\n]*", re.IGNORECASE)),
-    ("conclusion", re.compile(r"\bthe conclusion is\b[^.!?\r\n]*", re.IGNORECASE)),
-    ("inference", re.compile(r"\bthis means\b[^.!?\r\n]*", re.IGNORECASE)),
-    ("plan", re.compile(r"\bthe next move is\b[^.!?\r\n]*", re.IGNORECASE)),
-    ("falsified", re.compile(r"\bfalsified\b(?:\s*:\s*|\s+)[^.!?\r\n]+", re.IGNORECASE)),
-    ("supported", re.compile(r"\bsupported\b(?:\s*:\s*|\s+)[^.!?\r\n]+", re.IGNORECASE)),
-    ("blocked", re.compile(r"\bblocked\b(?:\s*:\s*|\s+)[^.!?\r\n]+", re.IGNORECASE)),
-    (
-        "non_collapse",
-        re.compile(r"\b[^.!?\r\n]*?(?:!=|≠|is not|does not imply)[^.!?\r\n]*", re.IGNORECASE),
-    ),
+SIMPLE_CLAUSE_SPECS = [
+    ("belief", re.compile(r"\bI think\b\s+.+?(?=[.!?](?:\s|$)|$)", re.IGNORECASE)),
+    ("decision", re.compile(r"\bwe decided\b\s+.+?(?=[.!?](?:\s|$)|$)", re.IGNORECASE)),
+    ("conclusion", re.compile(r"\bthe conclusion is\b\s+.+?(?=[.!?](?:\s|$)|$)", re.IGNORECASE)),
+    ("inference", re.compile(r"\bthis means\b\s+.+?(?=[.!?](?:\s|$)|$)", re.IGNORECASE)),
+    ("plan", re.compile(r"\bthe next move is\b\s+.+?(?=[.!?](?:\s|$)|$)", re.IGNORECASE)),
 ]
+CLAIM_LABEL_LINE_PATTERN = re.compile(
+    r"(?mi)^(?P<label>supported|falsified|blocked|verdict|finding|conclusion)\s*:\s*(?P<body>.+)$"
+)
+LINE_INITIAL_STATUS_PATTERN = re.compile(
+    r"(?mi)^(?P<label>supported|falsified|blocked)\b(?!\s*:)\s+(?P<body>.+)$"
+)
+NON_COLLAPSE_OPERATOR_PATTERN = re.compile(
+    r"(?P<claim>[A-Z][\w /-]{1,40}?\s*(?:!=|≠)\s*[\w /-]{1,40}?)(?=[.,;!?]|$)"
+)
+SHORT_LEFT_OPERAND = r"[A-Z][\w/-]+(?: [\w/-]+){0,4}"
+SHORT_RIGHT_OPERAND = r"(?:[A-Za-z][\w/-]*)(?: [A-Za-z][\w/-]*){0,4}"
+DOES_NOT_IMPLY_PATTERN = re.compile(
+    rf"(?P<claim>(?:(?<=^)|(?<=[.!?]\s)|(?<=\n)){SHORT_LEFT_OPERAND}\s+does not imply\s+{SHORT_RIGHT_OPERAND})(?=[.,;!?]|$)",
+    re.MULTILINE,
+)
+IS_NOT_CLAUSE_PATTERN = re.compile(
+    rf"(?P<claim>(?:(?<=^)|(?<=[.!?]\s)|(?<=\n)){SHORT_LEFT_OPERAND}\s+is not\s+{SHORT_RIGHT_OPERAND})(?=[.,;]|$)",
+    re.MULTILINE,
+)
+SHOULD_NOT_PATTERN = re.compile(
+    rf"(?P<claim>(?:(?<=^)|(?<=[.!?]\s)|(?<=\n)){SHORT_LEFT_OPERAND}\s+should not be\s+(?:treated as|confused with)\s+{SHORT_RIGHT_OPERAND})(?=[.,;]|$)",
+    re.MULTILINE | re.IGNORECASE,
+)
+CLAIM_LABEL_TYPE_MAP = {
+    "supported": "supported",
+    "falsified": "falsified",
+    "blocked": "blocked",
+    "conclusion": "conclusion",
+    "verdict": "other",
+    "finding": "other",
+}
 
 
 def first_nonempty(*values):
@@ -333,34 +357,75 @@ def build_claim_row(turn, char_start, char_end, claim_text, claim_type, extracti
     )
 
 
+def match_start_for_group(match, group_name):
+    return match.start(group_name)
+
+
+def match_end_for_group(match, group_name):
+    return match.end(group_name)
+
+
+def append_deterministic_claim(turn_matches, turn, char_start, char_end, claim_type):
+    if char_start == char_end:
+        return
+    claim_text = (turn["text"] or "")[char_start:char_end]
+    if not claim_text.strip():
+        return
+    turn_matches.append(
+        (
+            char_start,
+            build_claim_row(
+                turn,
+                char_start,
+                char_end,
+                claim_text,
+                claim_type,
+                "deterministic",
+            ),
+        )
+    )
+
+
 def extract_deterministic_claims_for_turn(turn):
     accepted_spans = []
     turn_matches = []
     text = turn["text"] or ""
-    for claim_type, pattern in PATTERN_SPECS:
+
+    for claim_type, pattern in SIMPLE_CLAUSE_SPECS:
         for match in pattern.finditer(text):
             char_start, char_end = match.span()
             if char_start == char_end:
                 continue
             if spans_overlap(char_start, char_end, accepted_spans):
                 continue
-            claim_text = text[char_start:char_end]
-            if not claim_text.strip():
+            accepted_spans.append((char_start, char_end))
+            append_deterministic_claim(turn_matches, turn, char_start, char_end, claim_type)
+
+    for pattern in (NON_COLLAPSE_OPERATOR_PATTERN, DOES_NOT_IMPLY_PATTERN, IS_NOT_CLAUSE_PATTERN, SHOULD_NOT_PATTERN):
+        for match in pattern.finditer(text):
+            char_start = match_start_for_group(match, "claim")
+            char_end = match_end_for_group(match, "claim")
+            if spans_overlap(char_start, char_end, accepted_spans):
                 continue
             accepted_spans.append((char_start, char_end))
-            turn_matches.append(
-                (
-                    char_start,
-                    build_claim_row(
-                        turn,
-                        char_start,
-                        char_end,
-                        claim_text,
-                        claim_type,
-                        "deterministic",
-                    ),
-                )
-            )
+            append_deterministic_claim(turn_matches, turn, char_start, char_end, "non_collapse")
+
+    for match in CLAIM_LABEL_LINE_PATTERN.finditer(text):
+        char_start, char_end = match.span()
+        if spans_overlap(char_start, char_end, accepted_spans):
+            continue
+        accepted_spans.append((char_start, char_end))
+        claim_type = CLAIM_LABEL_TYPE_MAP.get(match.group("label").lower(), "other")
+        append_deterministic_claim(turn_matches, turn, char_start, char_end, claim_type)
+
+    for match in LINE_INITIAL_STATUS_PATTERN.finditer(text):
+        char_start, char_end = match.span()
+        if spans_overlap(char_start, char_end, accepted_spans):
+            continue
+        accepted_spans.append((char_start, char_end))
+        claim_type = CLAIM_LABEL_TYPE_MAP.get(match.group("label").lower(), "other")
+        append_deterministic_claim(turn_matches, turn, char_start, char_end, claim_type)
+
     turn_matches.sort(key=lambda item: item[0])
     return [row for _, row in turn_matches]
 
