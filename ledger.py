@@ -15,6 +15,7 @@ LOCAL_MODEL_NAME = "all-MiniLM-L6-v2"
 LMSTUDIO_URL = "http://localhost:1234/v1/embeddings"
 DEFAULT_LLM_URL = "http://10.2.0.2:1234/v1/chat/completions"
 DEFAULT_LLM_MODEL = "microsoft/phi-4"
+LLM_REQUEST_TIMEOUT = (10, 600)
 REVERSAL_FLAG = "⚠ POSSIBLE REVERSAL"
 POSITIVE_TYPES = {"belief", "conclusion", "inference", "supported", "decision"}
 NEGATIVE_TYPES = {"falsified", "blocked"}
@@ -493,6 +494,19 @@ def extract_content_from_chat_response(body):
     return None
 
 
+def post_llm_chat(url, model, messages):
+    import requests
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0,
+        "stream": False,
+    }
+    headers = {"Content-Type": "application/json"}
+    return requests.post(url, json=payload, headers=headers, timeout=LLM_REQUEST_TIMEOUT)
+
+
 def extract_llm_claims(turn_rows, llm_url, llm_model):
     try:
         import requests
@@ -506,19 +520,20 @@ def extract_llm_claims(turn_rows, llm_url, llm_model):
     dropped_non_verbatim = 0
 
     for turn in turn_rows:
-        payload = {
-            "model": llm_model,
-            "messages": [
-                {"role": "system", "content": LLM_EXTRACTION_INSTRUCTIONS},
-                {"role": "user", "content": f"Message text:\n{turn['text'] or ''}"},
-            ],
-        }
-
         try:
-            response = requests.post(llm_url, json=payload, timeout=30)
+            response = post_llm_chat(
+                llm_url,
+                llm_model,
+                [
+                    {"role": "system", "content": LLM_EXTRACTION_INSTRUCTIONS},
+                    {"role": "user", "content": turn["text"] or ""},
+                ],
+            )
             response.raise_for_status()
         except requests.exceptions.RequestException as exc:
-            print(f"LLM extraction skipped: unable to reach {llm_url} ({exc})")
+            status_code = getattr(getattr(exc, "response", None), "status_code", "unknown")
+            body = getattr(exc.response, "text", "")[:500] if getattr(exc, "response", None) else ""
+            print(f"LLM extraction failed: {exc}\n  status code: {status_code}\n  response body: {body}")
             return [], set(), 0
 
         try:
@@ -569,6 +584,25 @@ def extract_llm_claims(turn_rows, llm_url, llm_model):
             llm_rows.extend(accepted_rows)
 
     return llm_rows, turns_with_claims, dropped_non_verbatim
+
+
+def probe_llm(llm_url, llm_model):
+    import requests
+
+    try:
+        response = post_llm_chat(
+            llm_url,
+            llm_model,
+            [{"role": "user", "content": "Reply with the single word: OK"}],
+        )
+        print(f"status code: {response.status_code}")
+        response.raise_for_status()
+        body = response.json()
+        print(extract_content_from_chat_response(body) or json.dumps(body, ensure_ascii=False))
+    except requests.exceptions.RequestException as exc:
+        body = getattr(getattr(exc, "response", None), "text", "")[:500]
+        status_code = getattr(getattr(exc, "response", None), "status_code", "unknown")
+        print(f"probe-llm failed: {exc}\nstatus code: {status_code}\nresponse body: {body}")
 
 
 def extract_claims(db_path, method, llm_url, llm_model):
@@ -950,6 +984,10 @@ def build_parser():
     extract_parser.add_argument("--llm-url", default=DEFAULT_LLM_URL)
     extract_parser.add_argument("--llm-model", default=DEFAULT_LLM_MODEL)
 
+    probe_parser = subparsers.add_parser("probe-llm")
+    probe_parser.add_argument("--llm-url", default=DEFAULT_LLM_URL)
+    probe_parser.add_argument("--llm-model", default=DEFAULT_LLM_MODEL)
+
     cluster_parser = subparsers.add_parser("cluster")
     cluster_parser.add_argument("--backend", choices=["local", "lmstudio"], default="local")
     cluster_parser.add_argument("--threshold", type=float, default=0.75)
@@ -976,6 +1014,8 @@ def main(argv=None):
         ingest_export(args.input_path, args.db, reset=args.reset)
     elif args.command == "extract":
         extract_claims(args.db, args.method, args.llm_url, args.llm_model)
+    elif args.command == "probe-llm":
+        probe_llm(args.llm_url, args.llm_model)
     elif args.command == "cluster":
         cluster_claims(args.db, args.backend, args.threshold)
     elif args.command == "stats":
